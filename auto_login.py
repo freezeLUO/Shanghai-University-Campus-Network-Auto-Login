@@ -7,9 +7,13 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import InvalidSessionIdException, WebDriverException
 import time
 import subprocess
 import traceback
+
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 
 class CampusNetworkLogin:
     def __init__(self) -> None:
@@ -23,8 +27,17 @@ class CampusNetworkLogin:
         # 设置 Chrome 选项
         chrome_options = webdriver.ChromeOptions()
         # 指定下载的 chrome.exe 路径
-        chrome_options.binary_location = r"D:\XunLei\chrome-win64\chrome.exe"
-        # chrome_options.add_argument("--headless") # 重新开启无头模式
+        chrome_options.binary_location = r"/home/cs/chrome-linux64/chrome"
+        # 无头模式开关：HEADLESS=1 强制无头；HEADLESS=0 强制有头；未设置则自动判断
+        headless_env = os.environ.get("HEADLESS", "").strip()
+        if headless_env == "1":
+            chrome_options.add_argument("--headless=new")
+            print("提示：已强制启用无头模式。")
+        elif headless_env == "0":
+            pass
+        elif not os.environ.get("DISPLAY"):
+            chrome_options.add_argument("--headless=new")
+            print("提示：未检测到图形界面，已启用无头模式。")
         chrome_options.add_argument("--no-sandbox")
         chrome_options.add_argument("--disable-gpu")
         chrome_options.add_argument("--disable-dev-shm-usage")
@@ -42,22 +55,77 @@ class CampusNetworkLogin:
         # 设置窗口大小，防止 headless 模式下元素重叠或不显示
         chrome_options.add_argument("--window-size=1920,1080")
 
+        # 指定本地 chromedriver，避免离线环境卡在自动下载
+        chromedriver_path = os.environ.get(
+            "CHROMEDRIVER_PATH",
+            "/home/cs/chromedriver-linux64/chromedriver",
+        )
+
+        self.chrome_options = chrome_options
+        self.chromedriver_path = chromedriver_path
+        self.driver = None
+        self._start_driver()
+
+    def _start_driver(self):
         try:
-            print("正在启动 Chrome...")
-            self.driver = webdriver.Chrome(options=chrome_options)
+            print(f"Chrome binary: {self.chrome_options.binary_location}", flush=True)
+            print(f"ChromeDriver: {self.chromedriver_path}", flush=True)
+            print("正在启动 Chrome...", flush=True)
+            if os.path.exists(self.chromedriver_path):
+                # 可选启用驱动日志：CHROMEDRIVER_LOG=1
+                if os.environ.get("CHROMEDRIVER_LOG") == "1":
+                    service = Service(
+                        self.chromedriver_path,
+                        service_args=["--verbose", "--log-path=chromedriver.log"],
+                        log_output="chromedriver.log",
+                    )
+                else:
+                    service = Service(self.chromedriver_path)
+                self.driver = webdriver.Chrome(service=service, options=self.chrome_options)
+                # 设置超时，避免驱动卡死
+                self.driver.set_page_load_timeout(20)
+                self.driver.set_script_timeout(20)
+                print("Chrome 启动完成。", flush=True)
+            else:
+                print(f"提示：未找到 chromedriver: {self.chromedriver_path}")
+                print("请下载匹配版本的 chromedriver，或设置 CHROMEDRIVER_PATH 环境变量。")
+                raise FileNotFoundError(self.chromedriver_path)
         except Exception as e:
             logging.error(f"启动 Chrome 失败: {e}")
             print("提示：请确保网络正常或驱动已正确下载。")
             exit(1)
 
+    def _safe_quit_driver(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+        self.driver = None
+
+    def _restart_driver(self, reason):
+        logging.warning("重启 Chrome 会话：%s", reason)
+        self._safe_quit_driver()
+        self._start_driver()
+
+    def _ensure_driver(self):
+        if not self.driver:
+            self._start_driver()
+            return
+        try:
+            _ = self.driver.title
+        except Exception as e:
+            self._restart_driver(f"会话不可用: {e}")
+
     # 登录校园网
     def login_campus_network(self):
-        driver = self.driver
         max_attempts = 3
         attempts = 0
 
         while attempts < max_attempts:
             try:
+                self._ensure_driver()
+                driver = self.driver
                 print(f"正在访问登录页面... 第 {attempts + 1} 次尝试")
                 driver.get('http://10.10.9.9/')
                 time.sleep(3) # 等待页面跳转
@@ -94,10 +162,10 @@ class CampusNetworkLogin:
                     # 回退到普通输入方式，防止 ActionChains 在某些情况下失效
                     try:
                          username_input.click()
-                         username_input.send_keys('23721830')
+                         username_input.send_keys('23721828')
                     except:
                          print("普通输入失败，尝试 ActionChains...")
-                         actions.click(username_input).send_keys('xxxxxxx').perform()
+                         actions.click(username_input).send_keys('23721828').perform()
                     
                     time.sleep(1) # 增加短暂等待
 
@@ -115,7 +183,7 @@ class CampusNetworkLogin:
                         EC.element_to_be_clickable((By.ID, 'pwd'))
                     )
                     password_input.clear()
-                    actions.click(password_input).send_keys('xxxxxxxx').perform()
+                    actions.click(password_input).send_keys('abc123CS').perform()
 
                     print("正在点击登录按钮...")
                     # 直接点击 a 标签
@@ -134,12 +202,23 @@ class CampusNetworkLogin:
                         print("登录后网络仍未通，可能账户密码错误或欠费。")
                         driver.save_screenshot('error_result.png')
                 
+                except (InvalidSessionIdException, WebDriverException) as e:
+                    print(f"页面会话失效，准备重启驱动: {e}")
+                    self._restart_driver(e)
+                    attempts += 1
                 except Exception as e:
                     print(f"操作页面元素时出错: {e}")
                     traceback.print_exc()
-                    driver.save_screenshot(f'error_step_{attempts}.png')
+                    try:
+                        driver.save_screenshot(f'error_step_{attempts}.png')
+                    except Exception:
+                        pass
                     attempts += 1
 
+            except (InvalidSessionIdException, WebDriverException) as e:
+                print(f"页面会话失效，准备重启驱动: {e}")
+                self._restart_driver(e)
+                attempts += 1
             except Exception as e:
                 print(f"页面加载出错: {e}")
                 attempts += 1
@@ -151,8 +230,13 @@ class CampusNetworkLogin:
     # 检查网络是否可以 ping 通百度
     def check_network_connection(self):
         try:
-            # Windows 下 ping 参数是 -n
-            result = subprocess.run(['ping', '-n', '1', 'www.baidu.com'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            # Linux/macOS 使用 -c，Windows 使用 -n
+            ping_flag = "-n" if os.name == "nt" else "-c"
+            result = subprocess.run(
+                ['ping', ping_flag, '1', 'www.baidu.com'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
             return result.returncode == 0
         except Exception as e:
             print(f"检查网络连接时出错: {e}")
@@ -167,5 +251,21 @@ class CampusNetworkLogin:
             self.login_campus_network()
 
 # 创建 CampusNetworkLogin 实例并调用 check_and_login 函数
+def _get_check_interval_seconds():
+    raw = os.environ.get("CHECK_INTERVAL", "60").strip()
+    try:
+        value = int(raw)
+        return max(5, value)
+    except ValueError:
+        logging.warning("无效的 CHECK_INTERVAL=%s，回退到 60 秒", raw)
+        return 60
+
 campus_network = CampusNetworkLogin()
-campus_network.check_and_login()
+interval_seconds = _get_check_interval_seconds()
+logging.info("进入常驻模式，每 %s 秒检查一次网络", interval_seconds)
+while True:
+    try:
+        campus_network.check_and_login()
+    except Exception:
+        logging.exception("循环执行时发生未捕获异常")
+    time.sleep(interval_seconds)
